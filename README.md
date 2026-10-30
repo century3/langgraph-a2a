@@ -66,6 +66,126 @@ python client.py
 - `300750 的最新价是多少？`：应路由到 `stock_Agent`。
 - `分析一下 688126 的股价和财务情况`：应路由到 `data_analyze_Agent`。
 
+## AgentCard 的创建与调用
+
+AgentCard 是远程智能体的名片。服务启动时在代码里创建它，A2A SDK 把它发布成 `/.well-known/agent.json`。宿主代理不写死智能体实现，只根据这张名片知道名称、地址和能力，再用名片里的 `name` 发起调用。
+
+```mermaid
+sequenceDiagram
+    participant S as stock/main.py 或 data_analyze/main.py
+    participant SDK as A2AStarletteApplication
+    participant C as HostAgent
+    participant R as RemoteAgentConnections
+
+    S->>S: AgentSkill + AgentCapabilities + AgentCard
+    S->>SDK: agent_card + RequestHandler
+    SDK-->>C: GET /.well-known/agent.json
+    C->>C: A2ACardResolver.get_agent_card()
+    C->>R: 按 card.name 保存连接
+    C->>R: MessageSendParams
+    R->>SDK: JSON-RPC message/send
+```
+
+### 服务端如何创建
+
+两个服务的创建方式相同，分别在 [stock/main.py](stock/main.py) 和 [data_analyze/main.py](data_analyze/main.py)。先声明能力和技能，再组装卡片：
+
+```python
+capabilities = AgentCapabilities(streaming=False, pushNotifications=True)
+skill = AgentSkill(
+    id="股票信息",
+    name="股票信息查询工具",
+    description="可以查询股票的代码，名称，收盘价等信息",
+    tags=["股票信息"],
+    examples=["300750是哪只股票的代码？"],
+)
+agent_card = AgentCard(
+    name="stock_Agent",          # 客户端 Action 必须使用这个名字
+    description="可以查询股票的代码，名称，收盘价等信息",
+    url=f"http://{host}:{port}/",  # 远程调用的 JSON-RPC 地址
+    version="1.0.0",
+    defaultInputModes=StockAgent.SUPPORTED_CONTENT_TYPES,   # text, text/plain
+    defaultOutputModes=StockAgent.SUPPORTED_CONTENT_TYPES,
+    capabilities=capabilities,
+    skills=[skill],
+)
+```
+
+字段分工：
+
+| 字段 | 作用 |
+| --- | --- |
+| `name` | 名片主键。客户端用它匹配 `Action: stock_Agent` 或 `Action: data_analyze_Agent`。 |
+| `description` | 放进宿主提示词，供模型决定该把问题交给谁。 |
+| `url` | 由启动参数 `--host` 和 `--port` 生成，是后续 `message/send` 的目标。 |
+| `skills` | 技能说明和示例问题。当前客户端路由只用 `name` 与 `description`，技能示例不会自动进入提示词。 |
+| `capabilities.streaming` | 两个服务都是 `False`，所以客户端走非流式 `send_message`，而不是 `send_message_streaming`。 |
+| `defaultInputModes` / `defaultOutputModes` | 来自各 Agent 类的 `SUPPORTED_CONTENT_TYPES`，当前为 `text` 和 `text/plain`。 |
+
+卡片本身不执行业务。它和真正的执行器一起交给服务器：
+
+```python
+request_handler = DefaultRequestHandler(
+    agent_executor=StockAgentExecutor(),  # 分析服务则是 DataAnalyzeAgentExecutor
+    task_store=InMemoryTaskStore(),
+    push_notifier=InMemoryPushNotifier(httpx_client),
+)
+server = A2AStarletteApplication(
+    agent_card=agent_card,
+    http_handler=request_handler,
+)
+uvicorn.run(server.build(), host=host, port=port)
+```
+
+因此新增一个远程智能体时，要同时做两件事：在对应 `main.py` 中创建新的 `AgentCard`，并把它的 `url` 加到客户端的 `remote_agent_addresses`。
+
+### 客户端如何发现和调用
+
+[client/client.py](client/client.py) 启动时遍历这两个地址：
+
+```python
+remote_agent_addresses = [
+    "http://localhost:10002",
+    "http://localhost:10001",
+]
+```
+
+`connect_to_server()` 对每个地址创建 `A2ACardResolver`，调用 `get_agent_card()` 拉取名片，再按 `card.name` 建立连接：
+
+```python
+card_resolver = A2ACardResolver(httpx_client=self.httpx_client, base_url=address)
+card = await card_resolver.get_agent_card()
+self.remote_agent_connections[card.name] = RemoteAgentConnections(self.httpx_client, card)
+self.cards[card.name] = card
+```
+
+`list_remote_agents()` 只把 `{name, description}` 写进路由提示词。模型输出 `Action` 后，`send_message()` 用这个名字找回连接，并组装 A2A 消息：
+
+```python
+request = MessageSendParams(
+    id=str(uuid.uuid4()),
+    message=Message(
+        role="user",
+        parts=[TextPart(text=message)],
+        messageId=messageId,
+    ),
+    configuration=MessageSendConfiguration(
+        acceptedOutputModes=["text", "text/plain", "image/png"],
+    ),
+)
+response = await client.send_message(request, self.task_callback)
+```
+
+[client/remote_agent_connection.py](client/remote_agent_connection.py) 用名片构造 `A2AClient`。因为本项目的 `streaming` 为 `False`，实际发送的是：
+
+```python
+response = await self.agent_client.send_message(
+    SendMessageRequest(id=str(uuid4()), params=request)
+)
+```
+
+返回若是 `Task`，客户端读取 `artifacts` 里的文本；若是 `Message`，读取第一个 part 的文本。这段文本成为下一轮模型输入中的 `Observation`。名片上的 `name` 写错或服务未启动时，`Action` 无法命中 `remote_agent_connections`，调用会直接失败。
+
 ## 总体流程
 
 ```mermaid
